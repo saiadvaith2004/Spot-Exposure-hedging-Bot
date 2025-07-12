@@ -3,9 +3,10 @@ import asyncio
 import ccxt
 import os
 import logging
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
-
+load_dotenv()
 # --- Logging Setup ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,7 +19,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN') 
+TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
+print(TELEGRAM_TOKEN)
 user_data = {}
 
 # --- Exchange Connection Functions ---
@@ -32,13 +34,18 @@ def get_binance_exchange(api_key, secret, futures=False):
                 'secret': secret,
                 'enableRateLimit': True,
                 'testnet': True,
+                'sandbox': True,  # Enable sandbox mode for testnet
                 'options': {
                     'defaultType': 'future',
                     'test': True,
+                    'adjustForTimeDifference': True,
                 },
                 'urls': {
                     'api': {
-                        'fapi': 'https://testnet.binancefuture.com/fapi/v2',
+                        'public': 'https://testnet.binancefuture.com/fapi/v1',
+                        'private': 'https://testnet.binancefuture.com/fapi/v1',
+                        'fapiPublic': 'https://testnet.binancefuture.com/fapi/v1',
+                        'fapiPrivate': 'https://testnet.binancefuture.com/fapi/v1',
                     }
                 }
             })
@@ -51,10 +58,15 @@ def get_binance_exchange(api_key, secret, futures=False):
                 'secret': secret,
                 'enableRateLimit': True,
                 'testnet': True,
+                'sandbox': True,  # Enable sandbox mode for testnet
+                'options': {
+                    'adjustForTimeDifference': True,
+                },
                 'urls': {
                     'api': {
                         'public': 'https://testnet.binance.vision/api/v3',
-                        'private': 'https://testnet.binance.vision/api/v3'
+                        'private': 'https://testnet.binance.vision/api/v3',
+                        'v3': 'https://testnet.binance.vision/api/v3',
                     }
                 }
             })
@@ -72,17 +84,34 @@ def get_binance_exchange(api_key, secret, futures=False):
 def get_btc_spot_balance(api_key, secret):
     #Fetch BTC balance from Binance spot account.
     exchange = get_binance_exchange(api_key, secret, futures=False)
+    print("Hi ",exchange)
     try:
+        # Test API connectivity first
+        logger.info(f"Testing API connectivity for API key {api_key[:10]}...")
+        ticker = exchange.fetch_ticker('BTC/USDT')
+        logger.info(f"API connectivity test successful for API key {api_key[:10]}...")
+        
+        # Fetch balance
+        logger.info(f"Fetching balance for API key {api_key[:10]}...")
         balance = exchange.fetch_balance()
+        print("Helo ",balance)
         if 'total' not in balance:
             logger.error(f"Invalid balance response for API key {api_key[:10]}...: {balance}")
             raise ValueError("Invalid balance response from Binance")
+        
         btc_balance = balance['total'].get('BTC', 0.0)
         logger.info(f"Fetched spot balance for API key {api_key[:10]}...: {btc_balance} BTC")
         return float(btc_balance)
+        
     except ccxt.AuthenticationError as e:
         logger.error(f"Authentication error fetching spot balance for API key {api_key[:10]}...: {e}")
-        raise ValueError(f"Invalid API key or permissions: {e}. Please generate a new key at https://testnet.binance.vision/")
+        error_msg = f"Authentication failed: {e}. "
+        error_msg += "Please check:\n"
+        error_msg += "1. API key and secret are correct\n"
+        error_msg += "2. API key has 'Read Info' permission enabled\n"
+        error_msg += "3. IP address is whitelisted (or disable IP restriction)\n"
+        error_msg += "4. You're using testnet keys from https://testnet.binance.vision/"
+        raise ValueError(error_msg)
     except ccxt.NetworkError as e:
         logger.error(f"Network error fetching spot balance for API key {api_key[:10]}...: {e}")
         raise ValueError(f"Network error: {e}. Check your internet connection or Binance testnet status.")
@@ -122,34 +151,88 @@ def get_btc_futures_position(api_key, secret):
         raise ValueError(f"Error fetching futures position: {e}")
 
 def hedge_btc_position(api_key, secret, spot_qty, hedge_ratio=1.0):
-    # Place a hedge order to offset spot BTC position with futures.
+    # Place a hedge order to offset spot BTC position with a short futures position.
     exchange = get_binance_exchange(api_key, secret, futures=True)
     try:
         hedge_qty = spot_qty * hedge_ratio
         if hedge_qty == 0:
             logger.info(f"No position to hedge for API key {api_key[:10]}...")
             return {"status": "no_hedge_needed", "message": "No position to hedge"}
-        # Place market sell order to hedge long spot position
-        order = exchange.create_market_sell_order('BTCUSDT', abs(hedge_qty))
+
+        # Ensure hedge mode is enabled for the account
+        try:
+            account_info = exchange.fapiPrivateGetAccount()
+            logger.info(f"Account info retrieved for API key {api_key[:10]}...")
+        except Exception as e:
+            logger.warning(f"Could not verify account settings: {e}")
+
+        # Binance USDM futures parameters for hedge mode
+        params = {
+            'positionSide': 'SHORT',  # Required for hedge mode
+            'timeInForce': 'GTC'  # Good Till Cancelled
+        }
+        
+        # Round to 3 decimals for BTCUSDT (Binance requirement)
+        hedge_qty = round(abs(hedge_qty), 3)
+        
+        # Place the hedge order (short futures to offset long spot)
+        order = exchange.create_market_sell_order('BTC/USDT', hedge_qty, params)
+        
         logger.info(f"Hedge order placed for API key {api_key[:10]}...: {order}")
-        return order
+        return {
+            "status": "success",
+            "order": order,
+            "hedge_qty": hedge_qty,
+            "hedge_ratio": hedge_ratio
+        }
+        
     except ccxt.AuthenticationError as e:
         logger.error(f"Authentication error placing hedge for API key {api_key[:10]}...: {e}")
         raise ValueError(f"Invalid API key or permissions: {e}")
     except ccxt.NetworkError as e:
         logger.error(f"Network error placing hedge for API key {api_key[:10]}...: {e}")
         raise ValueError(f"Network error: {e}")
+    except ccxt.InsufficientFunds as e:
+        logger.error(f"Insufficient funds for hedge order: {e}")
+        raise ValueError(f"Insufficient funds for hedge order: {e}")
+    except ccxt.InvalidOrder as e:
+        logger.error(f"Invalid order parameters: {e}")
+        raise ValueError(f"Invalid order parameters: {e}")
     except Exception as e:
         logger.error(f"Error placing hedge for API key {api_key[:10]}...: {e}")
         raise ValueError(f"Error placing hedge: {e}")
 
+def test_api_connectivity(api_key, secret):
+    results = {
+        'spot': {'success': False, 'error': None},
+        'futures': {'success': False, 'error': None}
+    }
+    
+    # Test spot connectivity
+    try:
+        spot_exchange = get_binance_exchange(api_key, secret, futures=False)
+        ticker = spot_exchange.fetch_ticker('BTC/USDT')
+        balance = spot_exchange.fetch_balance()
+        results['spot']['success'] = True
+        logger.info(f"Spot API test successful for API key {api_key[:10]}...")
+    except Exception as e:
+        results['spot']['error'] = str(e)
+        logger.error(f"Spot API test failed for API key {api_key[:10]}...: {e}")
+    
+    # Test futures connectivity
+    try:
+        futures_exchange = get_binance_exchange(api_key, secret, futures=True)
+        account_info = futures_exchange.fapiPrivateGetAccount()
+        results['futures']['success'] = True
+        logger.info(f"Futures API test successful for API key {api_key[:10]}...")
+    except Exception as e:
+        results['futures']['error'] = str(e)
+        logger.error(f"Futures API test failed for API key {api_key[:10]}...: {e}")
+    
+    return results
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message and instructions."""
-    await update.message.reply_text(
-        "Welcome to the Risk Management Bot!\n"
-        "Use /connect <api_key> <secret> to connect your Binance testnet account.\n"
-        "Then use /balance to check your BTC position or /hedge to hedge it."
-    )
+    await update.message.reply_text("Welcome to the Risk Management Bot!\n\n")
 
 async def connect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Connect user's Binance testnet account.
@@ -248,16 +331,19 @@ async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def hedge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #Show hedge ratio selection buttons.
+    print("Entered")
     keyboard = [
         [InlineKeyboardButton("Hedge 100%", callback_data='hedge_1.0')],
         [InlineKeyboardButton("Hedge 80%", callback_data='hedge_0.8')],
         [InlineKeyboardButton("Hedge 50%", callback_data='hedge_0.5')],
     ]
+    print("Hedge entered")
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('Select hedge ratio:', reply_markup=reply_markup)
 
 async def hedge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     #Handle hedge ratio selection and execute hedge order.
+    print("Call Back Entered advaith")
     query = update.callback_query
     await query.answer()
     hedge_ratio = float(query.data.split('_')[1])
@@ -270,7 +356,9 @@ async def hedge_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if spot_btc == 0:
             await query.edit_message_text("No BTC in your spot account to hedge.")
             return
+        print("If completed")
         order = hedge_btc_position(creds['api_key'], creds['secret'], spot_btc, hedge_ratio)
+        print("Stored in order")
         await query.edit_message_text(
             f"Hedged {hedge_ratio*100:.0f}% of your BTC spot position with a short futures order.\n"
             f"Order info: {order}"
@@ -312,16 +400,60 @@ async def monitor_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Unexpected error in monitor_risk for API key {creds.get('api_key', 'unknown')[:10]}...: {e}")
             await asyncio.sleep(30)
 
+async def test_connection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Test API key connectivity and permissions."""
+    user_id = update.effective_user.id
+    creds = user_data.get(user_id)
+    
+    if not creds:
+        await update.message.reply_text("Connect your account first with /connect <api_key> <secret>")
+        return
+    
+    await update.message.reply_text("Testing API connectivity... Please wait.")
+    
+    try:
+        results = test_api_connectivity(creds['api_key'], creds['secret'])
+        
+        response = "**API Connectivity Test Results:**\n\n"
+        
+        if results['spot']['success']:
+            response += "**Spot Trading**: Connected successfully\n"
+        else:
+            response += "**Spot Trading**: Failed\n"
+            response += f"Error: {results['spot']['error']}\n\n"
+        
+        if results['futures']['success']:
+            response += " **Futures Trading**: Connected successfully\n"
+        else:
+            response += "**Futures Trading**: Failed\n"
+            response += f"Error: {results['futures']['error']}\n\n"
+        
+        if results['spot']['success'] and results['futures']['success']:
+            response += "\n🎉 All tests passed! You can now use /hedge and /balance commands."
+        else:
+            response += "\n⚠️ Some tests failed. Please check your API key permissions at https://testnet.binance.vision/"
+            response += "\n\nRequired permissions:"
+            response += "\n- Read Info (for spot balance)"
+            response += "\n- Futures Trading (for hedge orders)"
+        
+        await update.message.reply_text(response)
+        
+    except Exception as e:
+        logger.error(f"Error in test_connection for user {user_id}: {e}")
+        await update.message.reply_text(f"Error testing connection: {str(e)}")
+
 def main():
     #Initialize and start the Telegram bot.
     try:
         application = Application.builder().token(TELEGRAM_TOKEN).build()
+        print(TELEGRAM_TOKEN)
         logger.info("Bot initialized successfully")
         application.add_handler(CommandHandler('start', start))
         application.add_handler(CommandHandler('connect', connect))
         application.add_handler(CommandHandler('balance', balance))
         application.add_handler(CommandHandler('monitor_risk', monitor_risk))
         application.add_handler(CommandHandler('hedge', hedge))
+        application.add_handler(CommandHandler('test_connection', test_connection))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, connect))
         application.add_handler(CallbackQueryHandler(hedge_callback, pattern='^hedge_'))
         application.run_polling()

@@ -1,0 +1,11 @@
+# Telegram Bot Dependencies
+python-telegram-bot==20.7
+python-dotenv==1.0.0
+
+# Cryptocurrency Exchange API
+ccxt==4.1.77
+
+# Additional utilities
+requests==2.31.0
+asyncio
+logging 
